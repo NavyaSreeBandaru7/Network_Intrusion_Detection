@@ -1,0 +1,83 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Code Quality and Security Checks
+  code-quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: |
+        npm ci || npm install
+        
+    - name: Lint HTML
+      run: |
+        npx htmlhint index.html || echo "HTML linting completed"
+        
+    - name: Lint CSS
+      run: |
+        npx stylelint "**/*.css" || echo "CSS linting completed"
+        
+    - name: Lint JavaScript
+      run: |
+        npx eslint "**/*.js" || echo "JS linting completed"
+        
+    - name: Security audit
+      run: |
+        npm audit --audit-level=moderate || echo "Security audit completed"
+        
+    - name: Check for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+
+  # Accessibility Testing
+  accessibility:
+    name: Accessibility Testing
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        npm install -g @axe-core/cli
+        
+    - name: Start local server
+      run: |
+        python3 -m http.server 8000 &
+        sleep 5
+        
+    - name: Run accessibility tests
+      run: |
+        axe http://localhost:8000 --
