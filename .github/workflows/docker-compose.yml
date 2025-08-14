@@ -1,0 +1,386 @@
+version: '3.8'
+
+# Advanced Network Intrusion Detection System - Docker Compose Configuration
+# Production-ready setup with monitoring, logging, and security features
+
+services:
+  # Main NIDS Application
+  nids-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: nids-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Persistent data
+      - nids-logs:/var/log/nids
+      - nids-data:/var/www/nids/data
+      - nids-exports:/var/www/nids/exports
+      # SSL certificates (if using external certs)
+      - ./ssl:/etc/nginx/ssl:ro
+      # Configuration overrides
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/default.conf:/etc/nginx/conf.d/default.conf:ro
+    environment:
+      - NGINX_WORKER_PROCESSES=auto
+      - NGINX_WORKER_CONNECTIONS=1024
+      - LOG_LEVEL=info
+      - TZ=UTC
+      - DOMAIN_NAME=${DOMAIN_NAME:-localhost}
+      - SSL_ENABLED=${SSL_ENABLED:-false}
+    networks:
+      - nids-network
+      - monitoring-network
+    depends_on:
+      - nids-db
+      - redis-cache
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nids.rule=Host(`${DOMAIN_NAME:-localhost}`)"
+      - "traefik.http.services.nids.loadbalancer.server.port=80"
+
+  # Database for storing logs and configuration
+  nids-db:
+    image: postgres:15-alpine
+    container_name: nids-database
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${DB_NAME:-nidsdb}
+      - POSTGRES_USER=${DB_USER:-nidsuser}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-changeme123}
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - nids-db-data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - nids-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-nidsuser} -d ${DB_NAME:-nidsdb}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  # Redis for caching and session management
+  redis-cache:
+    image: redis:7-alpine
+    container_name: nids-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme456}
+    volumes:
+      - nids-redis-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - nids-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  # Elasticsearch for log storage and analysis
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: nids-elasticsearch
+    restart: unless-stopped
+    environment:
+      - node.name=nids-es-node
+      - cluster.name=nids-cluster
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - nids-es-data:/usr/share/elasticsearch/data
+    networks:
+      - monitoring-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Kibana for log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: nids-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+    ports:
+      - "5601:5601"
+    volumes:
+      - nids-kibana-data:/usr/share/kibana/data
+    networks:
+      - monitoring-network
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Logstash for log processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    container_name: nids-logstash
+    restart: unless-stopped
+    volumes:
+      - ./config/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - nids-logs:/var/log/nids:ro
+    networks:
+      - monitoring-network
+      - nids-network
+    depends_on:
+      - elasticsearch
+    environment:
+      - "LS_JAVA_OPTS=-Xmx256m -Xms256m"
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: nids-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - nids-prometheus-data:/prometheus
+    networks:
+      - monitoring-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana for monitoring dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nids-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - nids-grafana-data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - monitoring-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Exporter for Prometheus metrics
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    container_name: nids-nginx-exporter
+    restart: unless-stopped
+    command:
+      - -nginx.scrape-uri=http://nids-app:80/nginx_status
+    networks:
+      - nids-network
+      - monitoring-network
+    depends_on:
+      - nids-app
+
+  # Node Exporter for system metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: nids-node-exporter
+    restart: unless-stopped
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - monitoring-network
+
+  # Alertmanager for alert management
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: nids-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./config/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - nids-alertmanager-data:/alertmanager
+    networks:
+      - monitoring-network
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+
+  # Backup service
+  backup:
+    image: alpine:latest
+    container_name: nids-backup
+    restart: "no"
+    volumes:
+      - nids-db-data:/data/db:ro
+      - nids-logs:/data/logs:ro
+      - nids-data:/data/app:ro
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    networks:
+      - nids-network
+    command: /backup.sh
+    profiles:
+      - backup
+
+  # Maintenance and cleanup service
+  maintenance:
+    image: alpine:latest
+    container_name: nids-maintenance
+    restart: "no"
+    volumes:
+      - nids-logs:/data/logs
+      - nids-exports:/data/exports
+      - ./scripts/cleanup.sh:/cleanup.sh:ro
+    command: /cleanup.sh
+    profiles:
+      - maintenance
+
+# Network definitions
+networks:
+  nids-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: nids-br
+  
+  monitoring-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: monitor-br
+
+# Volume definitions
+volumes:
+  nids-db-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgresql
+  
+  nids-redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+  
+  nids-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./logs
+  
+  nids-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/app
+  
+  nids-exports:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./exports
+  
+  nids-es-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/elasticsearch
+  
+  nids-kibana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/kibana
+  
+  nids-prometheus-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/prometheus
+  
+  nids-grafana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/grafana
+  
+  nids-alertmanager-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/alertmanager
+
+# Configuration for different environments
+# Development: docker-compose up
+# Production: docker-compose --profile production up
+# Backup: docker-compose --profile backup run backup
+# Maintenance: docker-compose --profile maintenance run maintenance
